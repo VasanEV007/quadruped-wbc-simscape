@@ -13,6 +13,9 @@ The robot autonomously executes a **22.4 s 5-phase mobile manipulation mission**
 
 ## Mission & Verification Visuals
 
+### Seamless Decoupled 3-DOF Arm Motion & Whole-Body Flow (Stage 6)
+![Stage 6 Seamless 3-DOF Flow Results](stage6_seamless_3dof_flow_results.png)
+
 ### Full 22.4 s Autonomous Pick-and-Place, Step Climb & U-Turn Mission (Stage 5)
 ![Stage 5 Full Mission Results](stage5_full_mission_results.png)
 
@@ -41,7 +44,9 @@ The robot autonomously executes a **22.4 s 5-phase mobile manipulation mission**
 | `raibert_foothold_planner.m` | 4 | Raibert velocity heuristic with turn-rate stride scaling, step-edge exclusion zone enforcement ($\ge 5.5\ \text{cm}$ safety margin from `x_step_start` and `x_step_end`), terrain-aware CoM height reference $z_{\text{com,des}}$, and elevated swing apex clearance ($h_{\text{swing}} = 14.5\ \text{cm}$) over step edges. |
 | `pure_pursuit_navigator.m` | 4 | Lookahead pure-pursuit path tracker ($L_d = 0.40\ \text{m}$) generating smooth forward velocity $v_{x,\text{cmd}}$ and yaw rate $\omega_{z,\text{cmd}}$ across the outbound step climb, $R = 0.70\ \text{m}$ semicircular U-turn, and return step descent. |
 | `arm_ik_planner.m` | 5 | 6-axis robotic arm forward kinematics, analytical + Damped-Least-Squares (DLS) 6-DOF inverse kinematics ($< 10^{-10}\ \text{m}$ residual), quintic minimum-jerk trajectory planner, and 6D dynamic base reaction wrench $w_{\text{arm}} = [F_{\text{arm}}; \tau_{\text{arm}}]$. |
-| `mission_supervisor.m` | 5 | 5-phase `22.4 s` autonomous mission supervisor and conditional vacuum suction gripper latch (engages when EE-to-box proximity $< 0.015\ \text{m}$ and suction is active). |
+| `arm_3dof_controller.m` | 6 | Decoupled 3-DOF arm controller ($\theta_1$ base yaw, $\theta_2$ shoulder pitch, $\theta_3$ elbow pitch, locked/compensated wrist Joints 4–6) with active 6-DOF base-twist velocity cancellation $v_{ee,d}^B = R_{wb}^T(v_{ee,d}^W - v_b - \omega_w \times (p_{ee,d}^W - p_b))$, closed-form elbow-up IK, $3 \times 3$ Jacobian $J_{3\text{dof}}$, and computed-torque + dynamic base wrench feedforward. |
+| `seamless_flow_planner.m` | 6 | $C^2$-continuous Hermite quintic spline planner with non-zero boundary velocity blending, world-frame task-space stabilization during trotting/step-climbing/U-turn, and overlapped pre-positioning during the final `1.0 s` of the return approach trot. |
+| `mission_supervisor.m` | 5–6 | 5-phase `22.4 s` autonomous mission supervisor and conditional vacuum suction gripper latch (engages when EE-to-box proximity $< 0.015\ \text{m}$ and suction is active). |
 | `wbc_step.m` | 3–5 | Real-time `1 kHz` unified whole-body control step called by the Simulink `WBC_Controller` MATLAB Function block. |
 | `wire_wbc_controller.m` | 3–5 | Programmatically wires `WBC_Controller` (`Stateflow.EMChart`), `1 kHz` `Zero-Order Hold` samplers, `1 ms` filtered `Simulink-PS Converter` actuation ports, and workspace telemetry loggers into `quadruped_wbc.slx`. |
 | `test_quadruped_vmc.m` | 1–5 | Automated MATLAB `functiontests` unit test suite (8 test cases covering mass budget, finite-difference Jacobians, static VMC gravity compensation, diagonal trot friction pyramid, swing apex trajectories, step-edge avoidance, pure-pursuit navigation, and 6-DOF arm IK/mission supervision). |

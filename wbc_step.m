@@ -1,13 +1,14 @@
 function [tau_legs_vec, tau_arm_vec, rpy_out, F_grf_vec, contact_mask, nav_log_vec, ...
           wrench_torso_assist, F_suction_world, q_arm_out, w_arm_out, mission_log_vec] = ...
     wbc_step(t, p_com, v_com, quat_wb, omega_w, q_legs_vec, dq_legs_vec, gait_mode, p_box_w, v_box_w)
-%WBC_STEP Whole-body control step for Stage 3, Stage 4 & Stage 5 (22.4 s Full Mission).
+%WBC_STEP Whole-body control step for Stages 3, 4, 5 & Stage 6 (Decoupled 3-DOF Arm Flow).
 %   Combines:
-%     - mission_supervisor.m (Stage 5 5-phase state machine & vacuum gripper suction)
-%     - arm_ik_planner.m (Stage 5 6-DOF arm FK/IK, minimum-jerk trajectories & w_arm FF)
-%     - pure_pursuit_navigator.m (Stage 4/5 lookahead path follower)
-%     - raibert_foothold_planner.m (Stage 4/5 step-edge avoidance & terrain-aware CoM height)
-%     - gait_swing_controller.m (Stage 3/4/5 diagonal trot scheduler & operational-space swing PD)
+%     - seamless_flow_planner.m (Stage 6 C^2 Hermite quintic trajectories & overlapped reach)
+%     - arm_3dof_controller.m (Stage 6 decoupled 3-DOF analytical IK & base-twist cancellation)
+%     - mission_supervisor.m (Stage 5/6 5-phase state machine & vacuum gripper suction)
+%     - pure_pursuit_navigator.m (Stage 4/5/6 lookahead path follower)
+%     - raibert_foothold_planner.m (Stage 4/5/6 step-edge avoidance & terrain-aware CoM height)
+%     - gait_swing_controller.m (Stage 3/4/5/6 diagonal trot scheduler & operational-space swing PD)
 %     - vmc_stance_controller.m (Stage 1 WLS ground reaction force distributor)
 
     persistent p_cached t_prev p_xy_int psi_int z_des_filt q_arm_state dq_arm_state
@@ -37,11 +38,15 @@ function [tau_legs_vec, tau_arm_vec, rpy_out, F_grf_vec, contact_mask, nav_log_v
     end
 
     if isempty(t_prev) || t_val <= 1.0e-6 || t_val < t_prev
-        t_prev       = t_val;
-        p_xy_int     = p_com_v(1:2);
-        psi_int      = 0.0;
-        z_des_filt   = p.z_nom + p.r_foot;
-        q_arm_state  = p.q_arm_stow;
+        t_prev     = t_val;
+        p_xy_int   = p_com_v(1:2);
+        psi_int    = 0.0;
+        z_des_filt = p.z_nom + p.r_foot;
+        % Initialize 3-DOF arm state at exact IK solution of initial home pose
+        p_home_0_w = [0.0; 0.0; p.z_nom + p.r_foot] + p.p_ee_home_b;
+        [q0_init, ~] = arm_3dof_controller(p_home_0_w, [0;0;0], [0;0;0], ...
+            [0; 0; p.z_nom + p.r_foot], [0;0;0], eye(3), [0;0;0], p.q_arm_stow, zeros(6,1), 0.0, p);
+        q_arm_state  = q0_init;
         dq_arm_state = zeros(6, 1);
     end
     dt = max(min(t_val - t_prev, 0.01), 0.0);
@@ -73,19 +78,19 @@ function [tau_legs_vec, tau_arm_vec, rpy_out, F_grf_vec, contact_mask, nav_log_v
 
     v_com_body = R_wb.' * v_com_v;
 
-    %% 2. Stage 5 Mission Supervisor & 6-Axis Arm Trajectory/Wrench Planner
+    %% 2. Stage 5/6 Mission Supervisor & Decoupled 3-DOF Arm Controller
     if gmode >= 3
         [phase_id, gmode_eff, q_arm_des, dq_arm_des, tau_arm_vec, w_arm_out, ...
-         suction_active, box_grasped, m_payload_active, F_suction_world, p_ee_world, prox_dist] = ...
+         suction_active, box_grasped, m_payload_active, F_suction_world, p_ee_world, prox_dist, ee_err_w] = ...
             mission_supervisor(t_val, p_com_v, v_com_v, R_wb, omega_v, ...
                                q_arm_state, dq_arm_state, p_box_v, v_box_v, p);
 
-        % Update internal closed-loop arm state with 1st-order servo response
-        alpha_arm = min(dt / 0.008, 1.0);
-        q_arm_state  = (1.0 - alpha_arm) * q_arm_state  + alpha_arm * q_arm_des;
+        % High-bandwidth 3-DOF servo tracking with base-twist feedforward
+        alpha_arm = min(dt / 0.003, 1.0);
+        q_arm_state  = (1.0 - alpha_arm) * (q_arm_state + dq_arm_des * dt) + alpha_arm * q_arm_des;
         dq_arm_state = (1.0 - alpha_arm) * dq_arm_state + alpha_arm * dq_arm_des;
         q_arm_out    = q_arm_state;
-        t_loco_start = p.t_phase1_end; % 3.5 s
+        t_loco_start = 3.35; % Overlapped trot start during post-pick carry tuck
     else
         phase_id         = 0;
         gmode_eff        = gmode;
@@ -98,15 +103,15 @@ function [tau_legs_vec, tau_arm_vec, rpy_out, F_grf_vec, contact_mask, nav_log_v
         F_suction_world  = [0.0; 0.0; 0.0];
         p_ee_world       = p_com_v + R_wb * p.p_ee_home_b;
         prox_dist        = norm(p_ee_world - p_box_v);
+        ee_err_w         = 0.0;
         t_loco_start     = p.t_stand_init;
     end
 
-    % Update active payload mass in parameter struct for VMC gravity compensation
     p_vmc = p;
     p_vmc.m_payload = m_payload_active;
     p_vmc.m_total   = p.m_trunk + p.num_legs * p.m_leg + p.m_arm + p.m_gripper + m_payload_active;
 
-    %% 3. Stage 4/5 Pure-Pursuit Navigation & Raibert Foothold Planning
+    %% 3. Stage 4/5/6 Pure-Pursuit Navigation & Raibert Foothold Planning
     if gmode_eff >= 2
         [v_cmd_body, omega_z_cmd, p_ref_xy, psi_ref] = ...
             pure_pursuit_navigator(t_val, p_com_v, rpy_out, p_vmc, t_loco_start);
@@ -136,7 +141,6 @@ function [tau_legs_vec, tau_arm_vec, rpy_out, F_grf_vec, contact_mask, nav_log_v
         p_td_world   = [p.hip_offsets(1:2, :); zeros(1, 4)];
 
         if gmode >= 3 && phase_id == 5
-            % Hold exact return table halt pose [x_return_goal; 2*R_uturn; pi] during Phase 5 Place
             p_xy_int = [p.x_return_goal; 2.0 * p.R_uturn];
             psi_int  = pi;
             p_ref_xy = p_xy_int;
@@ -147,7 +151,7 @@ function [tau_legs_vec, tau_arm_vec, rpy_out, F_grf_vec, contact_mask, nav_log_v
             t_val, q_mat, dq_mat, v_com_body, v_cmd_body, gmode_eff, p_vmc);
     end
 
-    %% 4. Stage 1 VMC Stance Controller with Dynamic Arm Reaction Wrench Feedforward
+    %% 4. Stage 1 VMC Stance Controller with Dynamic 3-DOF Arm Wrench Feedforward
     state.p_com = p_com_v;
     state.v_com = v_com_v;
     state.rpy   = rpy_out;
@@ -165,7 +169,6 @@ function [tau_legs_vec, tau_arm_vec, rpy_out, F_grf_vec, contact_mask, nav_log_v
         des_state.omega = [0.0; 0.0; 0.0];
     end
     des_state.a_com_ff = [0.0; 0.0; 0.0];
-    % Pass 6-axis arm dynamic reaction wrench directly into VMC feedforward port
     des_state.wrench_arm_ff = w_arm_out;
 
     [tau_stance_vmc, F_grf] = vmc_stance_controller( ...
@@ -236,6 +239,6 @@ function [tau_legs_vec, tau_arm_vec, rpy_out, F_grf_vec, contact_mask, nav_log_v
         prox_dist; ...
         p_ee_world(1); ...
         p_ee_world(2); ...
-        p_ee_world(3) ...
+        ee_err_w ...
     ];
 end

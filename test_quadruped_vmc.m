@@ -258,7 +258,7 @@ function test_stage5_arm_ik_and_mission_supervisor(testCase)
 
     % 1. Test 6-Axis Arm FK/IK accuracy (< 1e-6 m) and dynamic reaction wrench w_arm
     [q_des, dq_des, ~, p_ee_des, ~, w_arm, arm_info] = ...
-        arm_ik_planner(p.p_ee_home_b, p.p_ee_pick_b, 1.60, 1.25, 1.95, eye(3), p.m_box, p);
+        arm_ik_planner(p.p_ee_home_b, p.p_ee_pick_b, 1.95, 1.25, 1.95, eye(3), p.m_box, p);
     verifyEqual(testCase, numel(q_des), 6);
     verifyEqual(testCase, numel(dq_des), 6);
     verifyEqual(testCase, numel(w_arm), 6);
@@ -268,8 +268,11 @@ function test_stage5_arm_ik_and_mission_supervisor(testCase)
     % 2. Test Mission Supervisor across all 5 phases & proximity suction latch (< 0.015 m)
     p_com = [0.0; 0.0; p.z_nom + p.r_foot];
     v_com = [0.0; 0.0; 0.0];
+    p_pick_top_w = [p.box_init_pos(1); p.box_init_pos(2); p.table_height + p.box_side];
+    [q_at_pick, ~] = arm_3dof_controller(p_pick_top_w, [0;0;0], [0;0;0], ...
+        p_com, v_com, eye(3), [0;0;0], q_des, zeros(6,1), 0.0, p);
     [ph1, gm1, q_pick, ~, ~, ~, suc1, grasp1, m_pay1, ~, ~, prox1] = ...
-        mission_supervisor(1.95, p_com, v_com, eye(3), [0;0;0], q_des, zeros(6,1), p.box_init_pos, [0;0;0], p);
+        mission_supervisor(1.95, p_com, v_com, eye(3), [0;0;0], q_at_pick, zeros(6,1), p.box_init_pos, [0;0;0], p);
     verifyEqual(testCase, ph1, 1);
     verifyEqual(testCase, gm1, 0);
     verifyEqual(testCase, suc1, 1);
@@ -277,4 +280,63 @@ function test_stage5_arm_ik_and_mission_supervisor(testCase)
     verifyEqual(testCase, grasp1, 1);
     verifyEqual(testCase, m_pay1, p.m_box, 'AbsTol', 1.0e-12);
     verifyEqual(testCase, numel(q_pick), 6);
+end
+
+function test_stage6_decoupled_3dof_arm_and_seamless_flow(testCase)
+    p = params();
+
+    % 1. Verify active base-twist velocity cancellation in arm_3dof_controller:
+    %    When desired world EE velocity v_ee_des_w = [0; 0; 0] and the quadruped
+    %    base heaves/pitches with v_com_w and omega_w, J_3dof * dq_arm_des(1:3)
+    %    must cancel R_wb^T * (v_com_w + omega_w x (p_ee_w - p_com_w)).
+    p_com_w    = [0.50; 0.10; 0.52];
+    v_com_w    = [0.35; -0.04; 0.12]; % Heaving & surging base
+    omega_w    = [0.05; -0.08; 0.25]; % Rolling, pitching & yawing base
+    R_wb       = eye(3);
+    p_ee_des_w = p_com_w + [0.36; 0.12; 0.20];
+    v_ee_des_w = [0.0; 0.0; 0.0];     % Stationary world-frame target
+    a_ee_des_w = [0.0; 0.0; 0.0];
+
+    [q_des, dq_des, ~, tau_cmd, w_arm, p_ee_act_w, ee_err_m, arm3_info] = ...
+        arm_3dof_controller(p_ee_des_w, v_ee_des_w, a_ee_des_w, ...
+                            p_com_w, v_com_w, R_wb, omega_w, ...
+                            p.q_arm_stow, zeros(6, 1), p.m_box, p);
+
+    % Verify closed-form 3-DOF IK accuracy at q_des
+    [~, ~, ~, ~, ~, p_ee_at_qdes_w, err_at_qdes] = ...
+        arm_3dof_controller(p_ee_des_w, v_ee_des_w, a_ee_des_w, ...
+                            p_com_w, v_com_w, R_wb, omega_w, ...
+                            q_des, dq_des, p.m_box, p);
+    verifyLessThan(testCase, err_at_qdes, 1.0e-6);
+    verifyEqual(testCase, p_ee_at_qdes_w, p_ee_des_w, 'AbsTol', 1.0e-6);
+
+    % Verify base-twist velocity cancellation: v_ee_world = v_com + omega x r + R_wb*(J_3dof*dq_123) ~ 0
+    v_ee_mount_achieved = arm3_info.J_3dof * dq_des(1:3);
+    v_ee_world_achieved = v_com_w + cross(omega_w, p_ee_des_w - p_com_w) + R_wb * v_ee_mount_achieved;
+    verifyLessThan(testCase, norm(v_ee_world_achieved - v_ee_des_w), 0.015);
+    verifyEqual(testCase, numel(tau_cmd), 6);
+    verifyEqual(testCase, numel(w_arm), 6);
+    verifyGreaterThan(testCase, norm(p_ee_act_w), 0.0);
+    verifyGreaterThanOrEqual(testCase, ee_err_m, 0.0);
+
+    % 2. Verify C^2 continuity and overlapped pre-positioning in seamless_flow_planner
+    dt_eps = 1.0e-4;
+    knot_times = [1.25, 2.75, 18.50, 19.75, 21.65];
+    for k = 1:numel(knot_times)
+        tk = knot_times(k);
+        [p_minus, v_minus] = seamless_flow_planner(tk - dt_eps, [0.55; 1.40; 0.5058], [-0.15; 0; 0], [0; 0; pi], [0; 0; 0], p);
+        [p_plus,  v_plus]  = seamless_flow_planner(tk + dt_eps, [0.55; 1.40; 0.5058], [-0.15; 0; 0], [0; 0; pi], [0; 0; 0], p);
+        verifyLessThan(testCase, norm(p_plus - p_minus), 5.0e-4, ...
+            sprintf('Position discontinuity at knot t=%.2fs', tk));
+        verifyLessThan(testCase, norm(v_plus - v_minus), 5.0e-2, ...
+            sprintf('Velocity discontinuity at knot t=%.2fs', tk));
+    end
+
+    % Verify overlapped reach flag is active at t = 19.0 s (during final 1.0 s of return trot)
+    [~, ~, ~, ph_ov, gm_ov, suc_ov, flow_info] = ...
+        seamless_flow_planner(19.0, [0.65; 1.40; 0.5058], [-0.15; 0; 0], [0; 0; pi], [0; 0; 0], p);
+    verifyEqual(testCase, ph_ov, 4);
+    verifyEqual(testCase, gm_ov, 2);
+    verifyTrue(testCase, suc_ov);
+    verifyTrue(testCase, flow_info.is_overlapped_reach);
 end
