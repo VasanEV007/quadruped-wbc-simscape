@@ -1,0 +1,8 @@
+# MATLAB & Simulink build caches / temporary files
+slprj/
+*.slxc
+*.autosave
+*.asv
+*.mex*
+*~
+.DS_Store
